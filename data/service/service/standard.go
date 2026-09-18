@@ -1,0 +1,1025 @@
+package service
+
+import (
+	"context"
+	stdLog "log"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/IBM/sarama"
+	"github.com/kelseyhightower/envconfig"
+
+	eventsCommon "github.com/tidepool-org/go-common/events"
+	confirmationClient "github.com/tidepool-org/hydrophone/client"
+
+	"github.com/tidepool-org/platform-plugin-abbott/abbott"
+	abbottClient "github.com/tidepool-org/platform-plugin-abbott/abbott/client"
+	abbottProvider "github.com/tidepool-org/platform-plugin-abbott/abbott/provider"
+	abbottWork "github.com/tidepool-org/platform-plugin-abbott/abbott/work"
+
+	"github.com/tidepool-org/platform/application"
+	"github.com/tidepool-org/platform/auth"
+	"github.com/tidepool-org/platform/clinics"
+	dataDeduplicatorDeduplicator "github.com/tidepool-org/platform/data/deduplicator/deduplicator"
+	dataDeduplicatorFactory "github.com/tidepool-org/platform/data/deduplicator/factory"
+	dataEvents "github.com/tidepool-org/platform/data/events"
+	dataRawService "github.com/tidepool-org/platform/data/raw/service"
+	dataRawStoreStructuredMongo "github.com/tidepool-org/platform/data/raw/store/structured/mongo"
+	dataServiceApi "github.com/tidepool-org/platform/data/service/api"
+	dataServiceApiV1 "github.com/tidepool-org/platform/data/service/api/v1"
+	dataSourceServiceClient "github.com/tidepool-org/platform/data/source/service/client"
+	dataSourceStoreStructured "github.com/tidepool-org/platform/data/source/store/structured"
+	dataSourceStoreStructuredMongo "github.com/tidepool-org/platform/data/source/store/structured/mongo"
+	dataStoreMongo "github.com/tidepool-org/platform/data/store/mongo"
+	"github.com/tidepool-org/platform/errors"
+	"github.com/tidepool-org/platform/events"
+	"github.com/tidepool-org/platform/log"
+	"github.com/tidepool-org/platform/mailer"
+	metricClient "github.com/tidepool-org/platform/metric/client"
+	notificationsHistory "github.com/tidepool-org/platform/notifications/history"
+	notificationsWorkClaims "github.com/tidepool-org/platform/notifications/work/claims"
+	notificationsWorkConnectionsIssues "github.com/tidepool-org/platform/notifications/work/connections/issues"
+	notificationsWorkConnectionsRequests "github.com/tidepool-org/platform/notifications/work/connections/requests"
+	oauthProvider "github.com/tidepool-org/platform/oauth/provider"
+	"github.com/tidepool-org/platform/oura"
+	ouraClient "github.com/tidepool-org/platform/oura/client"
+	ouraDataWork "github.com/tidepool-org/platform/oura/data/work"
+	ouraDataWorkEvent "github.com/tidepool-org/platform/oura/data/work/event"
+	ouraDataWorkHistoric "github.com/tidepool-org/platform/oura/data/work/historic"
+	ouraDataWorkPeriodic "github.com/tidepool-org/platform/oura/data/work/periodic"
+	ouraDataWorkPersonal "github.com/tidepool-org/platform/oura/data/work/personal"
+	ouraProvider "github.com/tidepool-org/platform/oura/provider"
+	ouraUserWorkRevoke "github.com/tidepool-org/platform/oura/user/work/revoke"
+	ouraUserWorkSetup "github.com/tidepool-org/platform/oura/user/work/setup"
+	ouraWebhookWorkSubscribe "github.com/tidepool-org/platform/oura/webhook/work/subscribe"
+	"github.com/tidepool-org/platform/permission"
+	permissionClient "github.com/tidepool-org/platform/permission/client"
+	"github.com/tidepool-org/platform/platform"
+	serviceServer "github.com/tidepool-org/platform/service/server"
+	serviceService "github.com/tidepool-org/platform/service/service"
+	storeStructuredMongo "github.com/tidepool-org/platform/store/structured/mongo"
+	"github.com/tidepool-org/platform/summary"
+	summaryClient "github.com/tidepool-org/platform/summary/client"
+	synctaskStoreMongo "github.com/tidepool-org/platform/synctask/store/mongo"
+	"github.com/tidepool-org/platform/twiist"
+	"github.com/tidepool-org/platform/user"
+	userClient "github.com/tidepool-org/platform/user/client"
+	"github.com/tidepool-org/platform/work"
+	workBase "github.com/tidepool-org/platform/work/base"
+	workService "github.com/tidepool-org/platform/work/service"
+	workStoreStructuredMongo "github.com/tidepool-org/platform/work/store/structured/mongo"
+)
+
+type confirmationClientConfig struct {
+	ServiceAddress string `envconfig:"TIDEPOOL_CONFIRMATION_CLIENT_ADDRESS"`
+}
+
+func (c *confirmationClientConfig) Load() error {
+	return envconfig.Process("", c)
+}
+
+type Standard struct {
+	*serviceService.DEPRECATEDService
+	metricClient                   *metricClient.Client
+	permissionClient               *permissionClient.Client
+	dataStore                      *dataStoreMongo.Store
+	dataRawStructuredStore         *dataRawStoreStructuredMongo.Store
+	dataSourceStructuredStore      *dataSourceStoreStructuredMongo.Store
+	syncTaskStore                  *synctaskStoreMongo.Store
+	workStructuredStore            *workStoreStructuredMongo.Store
+	dataDeduplicatorFactory        *dataDeduplicatorFactory.Factory
+	clinicsClient                  clinics.Client
+	dataClient                     *Client
+	dataRawClient                  *dataRawService.Client
+	dataSourceClient               *dataSourceServiceClient.Client
+	mailerClient                   mailer.Client
+	summaryClient                  *summaryClient.Client
+	workClient                     *workService.Client
+	notificationsHistoryRecorder   notificationsHistory.Recorder
+	abbottClient                   *abbottClient.Client
+	ouraClient                     *ouraClient.Client
+	userClient                     user.Client
+	confirmationClient             confirmationClient.ClientWithResponsesInterface
+	workCoordinator                *workService.Coordinator
+	userEventsHandler              events.Runner
+	twiistServiceAccountAuthorizer *twiist.ServiceAccountAuthorizer
+	api                            *dataServiceApi.Standard
+	server                         *serviceServer.Standard
+}
+
+func NewStandard() *Standard {
+	return &Standard{
+		DEPRECATEDService: serviceService.NewDEPRECATEDService(),
+	}
+}
+
+func (s *Standard) Initialize(provider application.Provider) error {
+	if err := s.DEPRECATEDService.Initialize(provider); err != nil {
+		return err
+	}
+
+	if err := s.initializeMetricClient(); err != nil {
+		return err
+	}
+	if err := s.initializePermissionClient(); err != nil {
+		return err
+	}
+	if err := s.initializeDataStore(); err != nil {
+		return err
+	}
+	if err := s.initializeDataRawStructuredStore(); err != nil {
+		return err
+	}
+	if err := s.initializeDataSourceStructuredStore(); err != nil {
+		return err
+	}
+	if err := s.initializeSyncTaskStore(); err != nil {
+		return err
+	}
+	if err := s.initializeWorkStructuredStore(); err != nil {
+		return err
+	}
+	if err := s.initializeDataDeduplicatorFactory(); err != nil {
+		return err
+	}
+	if err := s.initializeClinicsClient(); err != nil {
+		return err
+	}
+	if err := s.initializeDataClient(); err != nil {
+		return err
+	}
+	if err := s.initializeDataRawClient(); err != nil {
+		return err
+	}
+	if err := s.initializeDataSourceClient(); err != nil {
+		return err
+	}
+	if err := s.initializeMailerClient(); err != nil {
+		return err
+	}
+	if err := s.initializeUserClient(); err != nil {
+		return err
+	}
+	if err := s.initializeSummaryClient(); err != nil {
+		return err
+	}
+	if err := s.initializeConfirmationClient(); err != nil {
+		return err
+	}
+	if err := s.initializeWorkClient(); err != nil {
+		return err
+	}
+	if err := s.initializeAbbottClient(); err != nil {
+		return err
+	}
+	if err := s.initializeOuraClient(); err != nil {
+		return err
+	}
+	if err := s.initializeNotificationsHistoryRecorder(); err != nil {
+		return err
+	}
+	if err := s.initializeWorkCoordinator(); err != nil {
+		return err
+	}
+	if err := s.initializeUserEventsHandler(); err != nil {
+		return err
+	}
+	if err := s.initializeTwiistServiceAccountAuthorizer(); err != nil {
+		return err
+	}
+	if err := s.initializeAPI(); err != nil {
+		return err
+	}
+	return s.initializeServer()
+}
+
+func (s *Standard) Terminate() {
+	if s.server != nil {
+		if err := s.server.Shutdown(); err != nil {
+			s.Logger().Errorf("Error while terminating the server: %v", err)
+		}
+		s.server = nil
+	}
+	s.api = nil
+	s.twiistServiceAccountAuthorizer = nil
+	if s.userEventsHandler != nil {
+		s.Logger().Debug("Terminating the userEventsHandler")
+		if err := s.userEventsHandler.Terminate(); err != nil {
+			s.Logger().Errorf("Error while terminating the userEventsHandler: %v", err)
+		}
+		s.userEventsHandler = nil
+	}
+	if s.workCoordinator != nil {
+		s.workCoordinator.Stop()
+		s.workCoordinator = nil
+	}
+	s.ouraClient = nil
+	s.abbottClient = nil
+	s.workClient = nil
+	s.summaryClient = nil
+	s.dataSourceClient = nil
+	s.dataRawClient = nil
+	s.dataClient = nil
+	s.clinicsClient = nil
+	s.dataDeduplicatorFactory = nil
+	if s.workStructuredStore != nil {
+		s.workStructuredStore.Terminate(context.Background())
+		s.workStructuredStore = nil
+	}
+	if s.syncTaskStore != nil {
+		s.syncTaskStore.Terminate(context.Background())
+		s.syncTaskStore = nil
+	}
+	if s.dataSourceStructuredStore != nil {
+		s.dataSourceStructuredStore.Terminate(context.Background())
+		s.dataSourceStructuredStore = nil
+	}
+	if s.dataRawStructuredStore != nil {
+		s.dataRawStructuredStore.Terminate(context.Background())
+		s.dataRawStructuredStore = nil
+	}
+	if s.dataStore != nil {
+		s.dataStore.Terminate(context.Background())
+		s.dataStore = nil
+	}
+	s.permissionClient = nil
+	s.metricClient = nil
+
+	s.DEPRECATEDService.Terminate()
+}
+
+func (s *Standard) Run() error {
+	if s.server == nil {
+		return errors.New("service not initialized")
+	}
+
+	errs := make(chan error)
+	go func() {
+		errs <- s.userEventsHandler.Run()
+	}()
+	go func() {
+		errs <- s.server.Serve()
+	}()
+
+	return <-errs
+}
+
+func (s *Standard) PermissionClient() permission.Client {
+	return s.permissionClient
+}
+
+func (s *Standard) DataSourceStructuredStore() dataSourceStoreStructured.Store {
+	return s.dataSourceStructuredStore
+}
+
+func (s *Standard) initializeMetricClient() error {
+	s.Logger().Debug("Loading metric client config")
+
+	cfg := platform.NewConfig()
+	cfg.UserAgent = s.UserAgent()
+	reporter := s.ConfigReporter().WithScopes("metric", "client")
+	loader := platform.NewConfigReporterLoader(reporter)
+	if err := cfg.Load(loader); err != nil {
+		return errors.Wrap(err, "unable to load metric client config")
+	}
+
+	s.Logger().Debug("Creating metric client")
+
+	clnt, err := metricClient.New(cfg, platform.AuthorizeAsUser, s.Name(), s.VersionReporter())
+	if err != nil {
+		return errors.Wrap(err, "unable to create metric client")
+	}
+	s.metricClient = clnt
+
+	return nil
+}
+
+func (s *Standard) initializePermissionClient() error {
+	s.Logger().Debug("Loading permission client config")
+
+	cfg := platform.NewConfig()
+	cfg.UserAgent = s.UserAgent()
+	reporter := s.ConfigReporter().WithScopes("permission", "client")
+	loader := platform.NewConfigReporterLoader(reporter)
+	if err := cfg.Load(loader); err != nil {
+		return errors.Wrap(err, "unable to load permission client config")
+	}
+
+	s.Logger().Debug("Creating permission client")
+
+	clnt, err := permissionClient.New(cfg, platform.AuthorizeAsService)
+	if err != nil {
+		return errors.Wrap(err, "unable to create permission client")
+	}
+	s.permissionClient = clnt
+
+	return nil
+}
+
+func (s *Standard) initializeDataStore() error {
+	s.Logger().Debug("Loading data store DEPRECATED config")
+
+	cfg := storeStructuredMongo.NewConfig()
+	if err := cfg.Load(); err != nil {
+		return errors.Wrap(err, "unable to load data store DEPRECATED config")
+	}
+	if err := cfg.SetDatabaseFromReporter(s.ConfigReporter().WithScopes("DEPRECATED", "data", "store")); err != nil {
+		return errors.Wrap(err, "unable to load data source structured store config")
+	}
+
+	s.Logger().Debug("Creating data store")
+
+	str, err := dataStoreMongo.NewStore(cfg)
+	if err != nil {
+		return errors.Wrap(err, "unable to create data store DEPRECATED")
+	}
+	s.dataStore = str
+
+	s.Logger().Debug("Ensuring data store DEPRECATED indexes")
+
+	err = s.dataStore.EnsureIndexes()
+	if err != nil {
+		return errors.Wrap(err, "unable to ensure data store DEPRECATED indexes")
+	}
+
+	return nil
+}
+
+func (s *Standard) initializeDataRawStructuredStore() error {
+	s.Logger().Debug("Loading data raw structured store config")
+
+	cfg := storeStructuredMongo.NewConfig()
+	if err := cfg.Load(); err != nil {
+		return errors.Wrap(err, "unable to load data raw structured store config")
+	}
+	if err := cfg.SetDatabaseFromReporter(s.ConfigReporter().WithScopes("DEPRECATED", "data", "store")); err != nil {
+		return errors.Wrap(err, "unable to load data source structured store config")
+	}
+
+	s.Logger().Debug("Creating data raw structured store")
+
+	str, err := dataRawStoreStructuredMongo.NewStore(cfg)
+	if err != nil {
+		return errors.Wrap(err, "unable to create data raw structured store")
+	}
+	s.dataRawStructuredStore = str
+
+	s.Logger().Debug("Ensuring data raw structured store indexes")
+
+	err = s.dataRawStructuredStore.EnsureIndexes()
+	if err != nil {
+		return errors.Wrap(err, "unable to ensure data raw structured store indexes")
+	}
+
+	return nil
+}
+
+func (s *Standard) initializeDataSourceStructuredStore() error {
+	s.Logger().Debug("Loading data source structured store config")
+
+	cfg := storeStructuredMongo.NewConfig()
+	if err := cfg.Load(); err != nil {
+		return errors.Wrap(err, "unable to load data source structured store config")
+	}
+
+	s.Logger().Debug("Creating data source structured store")
+
+	str, err := dataSourceStoreStructuredMongo.NewStore(cfg)
+	if err != nil {
+		return errors.Wrap(err, "unable to create data source structured store")
+	}
+	s.dataSourceStructuredStore = str
+
+	s.Logger().Debug("Ensuring data source structured store indexes")
+
+	err = s.dataSourceStructuredStore.EnsureIndexes()
+	if err != nil {
+		return errors.Wrap(err, "unable to ensure data source structured store indexes")
+	}
+
+	return nil
+}
+
+func (s *Standard) initializeSyncTaskStore() error {
+	s.Logger().Debug("Loading sync task store config")
+
+	cfg := storeStructuredMongo.NewConfig()
+	if err := cfg.Load(); err != nil {
+		return errors.Wrap(err, "unable to load sync task store config")
+	}
+	if err := cfg.SetDatabaseFromReporter(s.ConfigReporter().WithScopes("sync_task", "store")); err != nil {
+		return errors.Wrap(err, "unable to load sync task store config")
+	}
+
+	s.Logger().Debug("Creating sync task store")
+
+	str, err := synctaskStoreMongo.NewStore(cfg)
+	if err != nil {
+		return errors.Wrap(err, "unable to create sync task store")
+	}
+	s.syncTaskStore = str
+
+	return nil
+}
+
+func (s *Standard) initializeWorkStructuredStore() error {
+	s.Logger().Debug("Loading work structured store config")
+
+	cfg := storeStructuredMongo.NewConfig()
+	if err := cfg.Load(); err != nil {
+		return errors.Wrap(err, "unable to load work structured store config")
+	}
+
+	s.Logger().Debug("Creating work structured store")
+
+	str, err := workStoreStructuredMongo.NewStore(cfg)
+	if err != nil {
+		return errors.Wrap(err, "unable to create work structured store")
+	}
+	s.workStructuredStore = str
+
+	s.Logger().Debug("Ensuring work structured store indexes")
+
+	err = s.workStructuredStore.EnsureIndexes()
+	if err != nil {
+		return errors.Wrap(err, "unable to ensure work structured store indexes")
+	}
+
+	return nil
+}
+
+func (s *Standard) initializeDataDeduplicatorFactory() error {
+	s.Logger().Debug("Creating device deactivate hash deduplicator")
+
+	dataRepository := s.dataStore.NewDataRepository()
+	dependencies := dataDeduplicatorDeduplicator.Dependencies{
+		DataSetStore: dataRepository,
+		DataStore:    dataRepository,
+	}
+
+	deviceDeactivateHashDeduplicator, err := dataDeduplicatorDeduplicator.NewDeviceDeactivateHash(dependencies)
+	if err != nil {
+		return errors.Wrap(err, "unable to create device deactivate hash deduplicator")
+	}
+
+	s.Logger().Debug("Creating device truncate data set deduplicator")
+
+	deviceTruncateDataSetDeduplicator, err := dataDeduplicatorDeduplicator.NewDeviceTruncateDataSet(dependencies)
+	if err != nil {
+		return errors.Wrap(err, "unable to create device truncate data set deduplicator")
+	}
+
+	s.Logger().Debug("Creating data set delete origin deduplicator")
+
+	dataSetDeleteOriginDeduplicator, err := dataDeduplicatorDeduplicator.NewDataSetDeleteOrigin(dependencies)
+	if err != nil {
+		return errors.Wrap(err, "unable to create data set delete origin deduplicator")
+	}
+
+	s.Logger().Debug("Creating data set delete origin older deduplicator")
+
+	dataSetDeleteOriginOlderDeduplicator, err := dataDeduplicatorDeduplicator.NewDataSetDeleteOriginOlder(dependencies)
+	if err != nil {
+		return errors.Wrap(err, "unable to create data set delete origin older deduplicator")
+	}
+
+	s.Logger().Debug("Creating data set drop hash deduplicator")
+
+	dataSetDropHashDeduplicator, err := dataDeduplicatorDeduplicator.NewDataSetDropHash(dependencies)
+	if err != nil {
+		return errors.Wrap(err, "unable to create data set drop hash deduplicator")
+	}
+
+	s.Logger().Debug("Creating none deduplicator")
+
+	noneDeduplicator, err := dataDeduplicatorDeduplicator.NewNone(dependencies)
+	if err != nil {
+		return errors.Wrap(err, "unable to create none deduplicator")
+	}
+
+	s.Logger().Debug("Creating data deduplicator factory")
+
+	deduplicators := []dataDeduplicatorFactory.Deduplicator{
+		deviceDeactivateHashDeduplicator,
+		deviceTruncateDataSetDeduplicator,
+		dataSetDeleteOriginDeduplicator,
+		dataSetDeleteOriginOlderDeduplicator,
+		dataSetDropHashDeduplicator,
+		noneDeduplicator,
+	}
+
+	factory, err := dataDeduplicatorFactory.New(deduplicators)
+	if err != nil {
+		return errors.Wrap(err, "unable to create data deduplicator factory")
+	}
+	s.dataDeduplicatorFactory = factory
+
+	return nil
+}
+
+func (s *Standard) initializeClinicsClient() error {
+	s.Logger().Debug("Creating clinics client")
+
+	clnt, err := clinics.NewClient(s.AuthClient())
+	if err != nil {
+		return errors.Wrap(err, "unable to create clinics client")
+	}
+	s.clinicsClient = clnt
+
+	return nil
+}
+
+func (s *Standard) initializeDataClient() error {
+	s.Logger().Debug("Creating data client")
+
+	clnt, err := NewClient(s.dataStore, s.dataDeduplicatorFactory)
+	if err != nil {
+		return errors.Wrap(err, "unable to create data client")
+	}
+	s.dataClient = clnt
+
+	return nil
+}
+
+func (s *Standard) initializeDataRawClient() error {
+	s.Logger().Debug("Creating data raw client")
+
+	clnt, err := dataRawService.NewClient(s.dataRawStructuredStore)
+	if err != nil {
+		return errors.Wrap(err, "unable to create data raw client")
+	}
+	s.dataRawClient = clnt
+
+	return nil
+}
+
+func (s *Standard) initializeDataSourceClient() error {
+	s.Logger().Debug("Creating data source client")
+
+	clnt, err := dataSourceServiceClient.New(s)
+	if err != nil {
+		return errors.Wrap(err, "unable to create data source client")
+	}
+	s.dataSourceClient = clnt
+
+	return nil
+}
+
+func (s *Standard) initializeMailerClient() error {
+	s.Logger().Debug("Initializing mailer client")
+	client, err := mailer.NewClient()
+	if err != nil {
+		return errors.Wrap(err, "unable to create mailer client")
+	}
+	s.mailerClient = client
+	return nil
+}
+
+func (s *Standard) initializeUserClient() error {
+	s.Logger().Debug("Initializing user client")
+	client, err := userClient.NewDefaultClient(userClient.Params{
+		ConfigReporter: s.ConfigReporter(),
+		Logger:         s.Logger(),
+		UserAgent:      s.UserAgent(),
+	})
+	if err != nil {
+		return errors.Wrap(err, "unable to create user client")
+	}
+	s.userClient = client
+	return nil
+}
+
+func (s *Standard) initializeConfirmationClient() error {
+	s.Logger().Debug("Initializing confirmation client")
+
+	cfg := &confirmationClientConfig{}
+	if err := cfg.Load(); err != nil {
+		return errors.Wrap(err, "unable to load confirmation client config")
+	}
+
+	opts := confirmationClient.WithRequestEditorFn(func(ctx context.Context, req *http.Request) error {
+		token, err := s.AuthClient().ServerSessionToken()
+		if err != nil {
+			return err
+		}
+
+		req.Header.Set(auth.TidepoolSessionTokenHeaderKey, token)
+		return nil
+	})
+
+	client, err := confirmationClient.NewClientWithResponses(cfg.ServiceAddress, opts)
+	if err != nil {
+		return errors.Wrap(err, "unable to create confirmation client")
+	}
+	s.confirmationClient = client
+
+	return nil
+}
+
+func (s *Standard) initializeSummaryClient() error {
+	s.Logger().Debug("Creating summarizer registry")
+
+	summarizerRegistry := summary.New(
+		s.dataStore.NewSummaryRepository().GetStore(),
+		s.dataStore.NewBucketsRepository().GetStore(),
+		s.dataStore.NewDataRepository(),
+		s.dataStore.GetClient(),
+	)
+
+	s.Logger().Debug("Creating summary client")
+
+	clnt, err := summaryClient.New(summarizerRegistry)
+	if err != nil {
+		return errors.Wrap(err, "unable to create summary client")
+	}
+	s.summaryClient = clnt
+
+	return nil
+}
+
+func (s *Standard) initializeWorkClient() error {
+	s.Logger().Debug("Creating work client")
+
+	clnt, err := workService.NewClient(s.workStructuredStore)
+	if err != nil {
+		return errors.Wrap(err, "unable to create work client")
+	}
+	s.workClient = clnt
+
+	return nil
+}
+
+func (s *Standard) initializeAbbottClient() error {
+	s.Logger().Debug("Loading abbott provider")
+
+	// Abbott
+	abbottJWKS, err := oauthProvider.NewJWKS(s.ConfigReporter().WithScopes("provider", abbott.ProviderName))
+	if err != nil {
+		return errors.Wrap(err, "unable to create abbott jwks")
+	}
+	abbottProviderDependencies := abbottProvider.ProviderDependencies{
+		ConfigReporter:        s.ConfigReporter().WithScopes("provider"),
+		ProviderSessionClient: s.AuthClient(),
+		DataSourceClient:      s.dataSourceClient,
+		WorkClient:            s.workClient,
+		JWKS:                  abbottJWKS,
+	}
+	if prvdr, err := abbottProvider.New(abbottProviderDependencies); err != nil {
+		s.Logger().Warn("Unable to create abbott provider")
+	} else {
+		s.Logger().Debug("Loading abbott client config")
+
+		cfg := abbottClient.NewConfig()
+		cfg.UserAgent = s.UserAgent()
+		if err = cfg.LoadFromConfigReporter(s.ConfigReporter().WithScopes("abbott", "client")); err != nil {
+			return errors.Wrap(err, "unable to load abbott client config")
+		}
+
+		s.Logger().Debug("Creating abbott client")
+
+		abbottClientDependencies := abbottClient.ClientDependencies{
+			Config:            cfg,
+			TokenSourceSource: prvdr,
+		}
+		clnt, clntErr := abbottClient.NewClient(abbottClientDependencies)
+		if clntErr != nil {
+			return errors.Wrap(clntErr, "unable to create abbott client")
+		}
+		s.abbottClient = clnt
+	}
+
+	return nil
+}
+
+func (s *Standard) initializeOuraClient() error {
+	s.Logger().Debug("Loading oura provider")
+
+	configReporter := s.ConfigReporter().WithScopes("provider")
+
+	// Oura
+	if cfg, err := ouraProvider.NewConfigWithConfigReporter(configReporter.WithScopes(oura.ProviderName)); err != nil {
+		return errors.Wrap(err, "unable to create oura provider config")
+	} else if err = cfg.Validate(); err != nil {
+		s.Logger().WithError(err).Warn("Unable to create oura provider")
+	} else {
+		cfg.ClientConfig.UserAgent = s.UserAgent()
+		dependencies := ouraProvider.Dependencies{
+			Config:                *cfg,
+			ProviderSessionClient: s.AuthClient(),
+			DataSourceClient:      s.dataSourceClient,
+			WorkClient:            s.workClient,
+		}
+		if prvdr, err := ouraProvider.New(dependencies); err != nil {
+			return errors.Wrap(err, "unable to create oura provider")
+		} else {
+			s.ouraClient = prvdr.Client()
+		}
+	}
+
+	return nil
+}
+
+func (s *Standard) initializeNotificationsHistoryRecorder() error {
+	s.Logger().Debug("Creating notifications history recorder")
+
+	notificationsHistoryRecorder := notificationsHistory.NewHistoryRepository(s.dataRawStructuredStore.Store)
+	if err := notificationsHistoryRecorder.EnsureIndexes(); err != nil {
+		return errors.Wrap(err, "unable to ensure notifications history indexes")
+	}
+	s.notificationsHistoryRecorder = notificationsHistoryRecorder
+
+	return nil
+}
+
+func (s *Standard) initializeWorkCoordinator() error {
+	s.Logger().Debug("Creating work coordinator")
+
+	if coordinator, err := workService.NewCoordinator(s.Logger(), s.AuthClient(), s.workClient); err != nil {
+		return errors.Wrap(err, "unable to create work coordinator")
+	} else {
+		s.workCoordinator = coordinator
+	}
+
+	s.Logger().Debug("Creating work processor factories")
+
+	if err := s.initializeWorkProcessorFactories(); err != nil {
+		return errors.Wrap(err, "unable to create work processor factories")
+	}
+
+	s.Logger().Debug("Creating work singletons")
+
+	if err := s.initializeWorkSingletons(); err != nil {
+		return errors.Wrap(err, "unable to create work singletons")
+	}
+
+	s.Logger().Debug("Starting work coordinator")
+
+	s.workCoordinator.Start()
+
+	return nil
+}
+
+func (s *Standard) initializeWorkProcessorFactories() error {
+	var processorFactories []work.ProcessorFactory
+
+	dependencies := workBase.Dependencies{
+		WorkClient: s.workClient,
+	}
+
+	s.Logger().Debug("Creating notifications claims work processor factory")
+
+	if processorFactory, err := notificationsWorkClaims.NewProcessorFactory(notificationsWorkClaims.Dependencies{
+		Dependencies:       dependencies,
+		ClinicClient:       s.clinicsClient,
+		ConfirmationClient: s.confirmationClient,
+		HistoryRecorder:    s.notificationsHistoryRecorder,
+	}); err != nil {
+		return errors.Wrap(err, "unable to create notifications claims work processor factory")
+	} else {
+		processorFactories = append(processorFactories, processorFactory)
+	}
+
+	s.Logger().Debug("Creating notifications connections issues work processor factory")
+
+	if processorFactory, err := notificationsWorkConnectionsIssues.NewProcessorFactory(notificationsWorkConnectionsIssues.Dependencies{
+		Dependencies:    dependencies,
+		HistoryRecorder: s.notificationsHistoryRecorder,
+		MailerClient:    s.mailerClient,
+		UserClient:      s.userClient,
+	}); err != nil {
+		return errors.Wrap(err, "unable to create notifications connections issues work processor factory")
+	} else {
+		processorFactories = append(processorFactories, processorFactory)
+	}
+
+	s.Logger().Debug("Creating notifications connections requests work processor factory")
+
+	if processorFactory, err := notificationsWorkConnectionsRequests.NewProcessorFactory(notificationsWorkConnectionsRequests.Dependencies{
+		Dependencies:     dependencies,
+		ClinicClient:     s.clinicsClient,
+		DataSourceClient: s.dataSourceClient,
+		HistoryRecorder:  s.notificationsHistoryRecorder,
+		MailerClient:     s.mailerClient,
+		UserClient:       s.userClient,
+	}); err != nil {
+		return errors.Wrap(err, "unable to create notifications connections requests work processor factory")
+	} else {
+		processorFactories = append(processorFactories, processorFactory)
+	}
+
+	if s.abbottClient != nil {
+		s.Logger().Debug("Creating abbott processor factories")
+
+		abbottProcessorDependencies := abbottWork.ProcessorDependencies{
+			Dependencies:            dependencies,
+			DataDeduplicatorFactory: s.dataDeduplicatorFactory,
+			DataSetClient:           s.dataClient,
+			DataSourceClient:        s.dataSourceClient,
+			SummaryClient:           s.summaryClient,
+			ProviderSessionClient:   s.AuthClient(),
+			DataRawClient:           s.dataRawClient,
+			AbbottClient:            s.abbottClient,
+		}
+		if abbottProcessorFactories, err := abbottWork.NewProcessorFactories(abbottProcessorDependencies); err != nil {
+			return errors.Wrap(err, "unable to create abbott processor factories")
+		} else {
+			processorFactories = append(processorFactories, abbottProcessorFactories...)
+		}
+	}
+
+	if s.ouraClient != nil {
+		s.Logger().Debug("Creating oura data event work processor factory")
+
+		if processorFactory, err := ouraDataWorkEvent.NewProcessorFactory(ouraDataWork.Dependencies{
+			Dependencies:          dependencies,
+			ProviderSessionClient: s.AuthClient(),
+			DataSourceClient:      s.dataSourceClient,
+			DataRawClient:         s.dataRawClient,
+			OuraClient:            s.ouraClient,
+		}); err != nil {
+			return errors.Wrap(err, "unable to create oura data event work processor factory")
+		} else {
+			processorFactories = append(processorFactories, processorFactory)
+		}
+
+		s.Logger().Debug("Creating oura data historic work processor factory")
+
+		if processorFactory, err := ouraDataWorkHistoric.NewProcessorFactory(ouraDataWork.Dependencies{
+			Dependencies:          dependencies,
+			ProviderSessionClient: s.AuthClient(),
+			DataSourceClient:      s.dataSourceClient,
+			DataRawClient:         s.dataRawClient,
+			OuraClient:            s.ouraClient,
+		}); err != nil {
+			return errors.Wrap(err, "unable to create oura data historic work processor factory")
+		} else {
+			processorFactories = append(processorFactories, processorFactory)
+		}
+
+		s.Logger().Debug("Creating oura data periodic work processor factory")
+
+		if processorFactory, err := ouraDataWorkPeriodic.NewProcessorFactory(ouraDataWork.Dependencies{
+			Dependencies:          dependencies,
+			ProviderSessionClient: s.AuthClient(),
+			DataSourceClient:      s.dataSourceClient,
+			DataRawClient:         s.dataRawClient,
+			OuraClient:            s.ouraClient,
+		}); err != nil {
+			return errors.Wrap(err, "unable to create oura data periodic work processor factory")
+		} else {
+			processorFactories = append(processorFactories, processorFactory)
+		}
+
+		s.Logger().Debug("Creating oura data personal work processor factory")
+
+		if processorFactory, err := ouraDataWorkPersonal.NewProcessorFactory(ouraDataWork.Dependencies{
+			Dependencies:          dependencies,
+			ProviderSessionClient: s.AuthClient(),
+			DataSourceClient:      s.dataSourceClient,
+			DataRawClient:         s.dataRawClient,
+			OuraClient:            s.ouraClient,
+		}); err != nil {
+			return errors.Wrap(err, "unable to create oura data personal work processor factory")
+		} else {
+			processorFactories = append(processorFactories, processorFactory)
+		}
+
+		s.Logger().Debug("Creating oura webhook work processor factory")
+
+		if processorFactory, err := ouraWebhookWorkSubscribe.NewProcessorFactory(ouraWebhookWorkSubscribe.Dependencies{
+			Dependencies: dependencies,
+			OuraClient:   s.ouraClient,
+		}); err != nil {
+			return errors.Wrap(err, "unable to create oura webhook work processor factory")
+		} else {
+			processorFactories = append(processorFactories, processorFactory)
+		}
+
+		s.Logger().Debug("Creating oura user revoke work processor factory")
+
+		if processorFactory, err := ouraUserWorkRevoke.NewProcessorFactory(ouraUserWorkRevoke.Dependencies{
+			Dependencies: dependencies,
+			OuraClient:   s.ouraClient,
+		}); err != nil {
+			return errors.Wrap(err, "unable to create oura user revoke work processor factory")
+		} else {
+			processorFactories = append(processorFactories, processorFactory)
+		}
+
+		s.Logger().Debug("Creating oura user setup work processor factory")
+
+		if processorFactory, err := ouraUserWorkSetup.NewProcessorFactory(ouraUserWorkSetup.Dependencies{
+			Dependencies:          dependencies,
+			ProviderSessionClient: s.AuthClient(),
+			DataSourceClient:      s.dataSourceClient,
+			DataSetClient:         s.dataClient,
+			OuraClient:            s.ouraClient,
+		}); err != nil {
+			return errors.Wrap(err, "unable to create oura user setup work processor factory")
+		} else {
+			processorFactories = append(processorFactories, processorFactory)
+		}
+	}
+
+	s.Logger().Debug("Registering work processor factories")
+
+	if err := s.workCoordinator.RegisterProcessorFactories(processorFactories); err != nil {
+		return errors.Wrap(err, "unable to register work processor factories")
+	}
+
+	return nil
+}
+
+func (s *Standard) initializeWorkSingletons() error {
+	ctx, cancel := context.WithTimeout(log.NewContextWithLogger(context.Background(), s.Logger()), 10*time.Second)
+	defer cancel()
+
+	if s.ouraClient != nil {
+		s.Logger().Debug("Creating oura webhook subscribe work")
+
+		if workCreate, err := ouraWebhookWorkSubscribe.NewWorkCreate(); err != nil {
+			return errors.Wrap(err, "unable to create oura webhook subscribe work create")
+		} else if _, err = s.workClient.Create(ctx, workCreate); err != nil {
+			return errors.Wrap(err, "unable to create oura webhook subscribe work")
+		}
+	}
+
+	return nil
+}
+
+func (s *Standard) initializeUserEventsHandler() error {
+	s.Logger().Debug("Initializing user events handler")
+
+	sarama.Logger = stdLog.New(os.Stdout, "SARAMA ", stdLog.LstdFlags|stdLog.Lshortfile)
+
+	ctx := log.NewContextWithLogger(context.Background(), s.Logger())
+	handler := dataEvents.NewUserDataDeletionHandler(ctx, s.dataStore, s.dataSourceStructuredStore)
+	handlers := []eventsCommon.EventHandler{handler}
+	runner := events.NewRunner(handlers)
+	if err := runner.Initialize(); err != nil {
+		return errors.Wrap(err, "unable to initialize user events handler runner")
+	}
+	s.userEventsHandler = runner
+
+	return nil
+}
+
+func (s *Standard) initializeTwiistServiceAccountAuthorizer() error {
+	s.Logger().Debug("Initializing twiist service account authorizer")
+
+	twiistServiceAccountAuthorizer, err := twiist.NewServiceAccountAuthorizer()
+	if err != nil {
+		return errors.Wrap(err, "unable to initialize twiist service account authorizer")
+	}
+	s.twiistServiceAccountAuthorizer = twiistServiceAccountAuthorizer
+
+	return nil
+}
+
+func (s *Standard) initializeAPI() error {
+	s.Logger().Debug("Creating api")
+
+	newAPI, err := dataServiceApi.NewStandard(s, s.metricClient, s.permissionClient,
+		s.dataDeduplicatorFactory,
+		s.dataStore, s.syncTaskStore, s.dataClient,
+		s.dataRawClient, s.dataSourceClient, s.workClient, s.ouraClient, s.notificationsHistoryRecorder,
+		s.abbottClient, s.twiistServiceAccountAuthorizer)
+	if err != nil {
+		return errors.Wrap(err, "unable to create api")
+	}
+	s.api = newAPI
+
+	s.Logger().Debug("Initializing api middleware")
+
+	if err = s.api.InitializeMiddleware(); err != nil {
+		return errors.Wrap(err, "unable to initialize api middleware")
+	}
+
+	s.Logger().Debug("Initializing api router")
+
+	if err = s.api.DEPRECATEDInitializeRouter(dataServiceApiV1.Routes()); err != nil {
+		return errors.Wrap(err, "unable to initialize api router")
+	}
+
+	return nil
+}
+
+func (s *Standard) initializeServer() error {
+	s.Logger().Debug("Loading server config")
+
+	serverConfig := serviceServer.NewConfig()
+	if err := serverConfig.Load(s.ConfigReporter().WithScopes("server")); err != nil {
+		return errors.Wrap(err, "unable to load server config")
+	}
+
+	s.Logger().Debug("Creating server")
+
+	newServer, err := serviceServer.NewStandard(serverConfig, s.Logger(), s.api)
+	if err != nil {
+		return errors.Wrap(err, "unable to create server")
+	}
+	s.server = newServer
+
+	return nil
+}
