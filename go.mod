@@ -141,4 +141,4 @@ replace github.com/tidepool-org/hydrophone/client => github.com/exaleian/hydroph
 
 replace github.com/tidepool-org/clinic/client => github.com/exaleian/clinic/client v0.0.0-20260918165154-a24b352cb689
 
-replace github.com/tidepool-org/devices/api => github.com/exaleian/devices/api db987d8e59ddb0d9fb50ad0a36a2a3a5939b5762
+replace github.com/tidepool-org/devices/api => github.com/exaleian/devices/api v0.0.0-20260918170059-db987d8e59dd
