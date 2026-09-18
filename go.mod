@@ -75,7 +75,6 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect
 	github.com/goccy/go-json v0.10.3 // indirect
-	github.com/golang/mock v1.6.0 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/gomarkdown/markdown v0.0.0-20250311123330-531bef5e742b // indirect
 	github.com/google/pprof v0.0.0-20250403155104-27863c87afa6 // indirect
@@ -139,4 +138,7 @@ replace github.com/tidepool-org/platform-plugin-abbott => ./plugin/abbott
 replace github.com/tidepool-org/go-common => github.com/exaleian/go-common v0.0.0-20260918113248-ac7534059e9c
 
 replace github.com/tidepool-org/hydrophone/client => github.com/exaleian/hydrophone/client v0.0.0-20260918163153-988181e546ac
-replace github.com/tidepool-org/clinic/client => github.com/exaleian/clinic/client a24b352cb689ee2586fc5290b73ac4d63bb3c917
+
+replace github.com/tidepool-org/clinic/client => github.com/exaleian/clinic/client v0.0.0-20260918165154-a24b352cb689
+
+replace github.com/tidepool-org/devices/api => github.com/exaleian/devices/api db987d8e59ddb0d9fb50ad0a36a2a3a5939b5762
