@@ -135,3 +135,4 @@ require (
 )
 
 replace github.com/tidepool-org/platform-plugin-abbott => ./plugin/abbott
+replace github.com/tidepool-org/go-common => github.com/exaleian/go-common 8c5789d87f55
