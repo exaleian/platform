@@ -135,7 +135,7 @@ require (
 
 replace github.com/tidepool-org/platform-plugin-abbott => ./plugin/abbott
 
-replace github.com/tidepool-org/go-common => github.com/exaleian/go-common v0.0.0-20260918113248-ac7534059e9c
+replace github.com/tidepool-org/go-common => github.com/exaleian/go-common2 8c5789d87f55f378e71651a188017ed460bcf552
 
 replace github.com/tidepool-org/hydrophone/client => github.com/exaleian/hydrophone/client v0.0.0-20260918163153-988181e546ac
 
